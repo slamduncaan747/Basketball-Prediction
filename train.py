@@ -13,7 +13,7 @@ import wandb
 from datetime import datetime
 from typing import Dict, Optional
 
-# Import model components (ensure model.py is in the same directory)
+# Import model components
 from model import (
     BasketballMomentumTransformer, 
     MomentumLoss, 
@@ -37,24 +37,12 @@ logger = logging.getLogger(__name__)
 # ==========================================
 
 class BasketballDataset(Dataset):
-    """
-    PyTorch Dataset for basketball sequences.
-    Uses memory mapping (mmap) to handle large files without overloading RAM.
-    """
-    
     def __init__(self, data_dir: str, split: str = 'train', split_ratio: float = 0.9):
         self.data_dir = Path(data_dir)
-        
-        # Load event_ids first to determine size
-        # mmap_mode='r' keeps the array on disk, only loading chunks when accessed
-        self.event_ids = np.load("../" / self.data_dir / 'event_ids.npy', mmap_mode='r')
+        self.event_ids = np.load(self.data_dir / 'event_ids.npy', mmap_mode='r')
         self.n_samples = len(self.event_ids)
         
-        # --- CRITICAL: SEQUENTIAL SPLIT ---
-        # We split by index (0-90% = Train, 90-100% = Val) rather than random shuffle.
-        # This prevents "future" sequences from leaking into the training set.
         split_idx = int(self.n_samples * split_ratio)
-        
         if split == 'train':
             self.indices = np.arange(0, split_idx)
         else:
@@ -62,7 +50,6 @@ class BasketballDataset(Dataset):
             
         logger.info(f"Initialized {split} dataset with {len(self.indices)} samples (Sequential Split).")
 
-        # Load other arrays in read-only mode
         self.team_indicators = np.load(self.data_dir / 'team_indicators.npy', mmap_mode='r')
         self.score_differentials = np.load(self.data_dir / 'score_differentials.npy', mmap_mode='r')
         self.game_progress = np.load(self.data_dir / 'game_progress.npy', mmap_mode='r')
@@ -71,7 +58,6 @@ class BasketballDataset(Dataset):
         self.momentum_features = np.load(self.data_dir / 'momentum_features.npy', mmap_mode='r')
         self.targets = np.load(self.data_dir / 'targets.npy', mmap_mode='r')
         
-        # Load vocab for metadata
         with open(self.data_dir / 'vocab.json') as f:
             self.vocab = json.load(f)
 
@@ -79,10 +65,7 @@ class BasketballDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # Map dataset index to global file index
         real_idx = self.indices[idx]
-        
-        # Convert to tensor (this copies the specific row from disk to RAM)
         return {
             'event_ids': torch.tensor(self.event_ids[real_idx], dtype=torch.long),
             'team_indicators': torch.tensor(self.team_indicators[real_idx], dtype=torch.long),
@@ -95,32 +78,15 @@ class BasketballDataset(Dataset):
         }
 
     def get_class_weights(self) -> torch.Tensor:
-        """
-        Calculate weights to balance the loss function.
-        Basketball data is imbalanced (lots of 0: No Score vs 1/2: Score).
-        """
         logger.info("Calculating class weights from training targets...")
-        
-        # Only look at the specific indices for this split (e.g. training set)
         subset_targets = self.targets[self.indices]
-        
-        # Flatten (Batch * Seq_Len) to count every token
         flat_targets = subset_targets.reshape(-1)
-        
-        # Count occurrences (bins: 0, 1, 2)
         counts = np.bincount(flat_targets, minlength=3)
         total = counts.sum()
-        
-        # Standard inverse frequency formula: Total / (n_classes * count)
-        # Add epsilon (1e-6) to prevent division by zero
         weights = total / (3 * counts + 1e-6)
-        
-        # Normalize so they sum roughly to n_classes (optional, keeps loss scale similar)
         weights_norm = weights / weights.sum() * 3
-        
         logger.info(f"Class Counts: {counts}")
         logger.info(f"Calculated Weights: {weights_norm}")
-        
         return torch.tensor(weights_norm, dtype=torch.float32)
 
 # ==========================================
@@ -128,15 +94,7 @@ class BasketballDataset(Dataset):
 # ==========================================
 
 class Trainer:
-    def __init__(
-        self, 
-        model, 
-        train_loader, 
-        val_loader, 
-        config, 
-        output_dir, 
-        class_weights=None
-    ):
+    def __init__(self, model, train_loader, val_loader, config, output_dir, class_weights=None):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -144,29 +102,23 @@ class Trainer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Device Setup
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = self.model.to(self.device)
         logger.info(f"Training on device: {self.device}")
 
-        # --- LOSS SETUP WITH CLASS WEIGHTS ---
         if class_weights is not None:
             class_weights = class_weights.to(self.device)
             
-        # Initialize the custom MomentumLoss
         self.loss_fn = MomentumLoss(
             score_weight=config.get('score_weight', 1.0),
             momentum_weight=config.get('momentum_weight', 0.5),
             label_smoothing=config.get('label_smoothing', 0.1)
         )
-        
-        # Inject the weights into the internal CrossEntropyLoss
         self.loss_fn.score_loss = nn.CrossEntropyLoss(
             weight=class_weights,
             label_smoothing=config.get('label_smoothing', 0.1)
         )
 
-        # Optimization
         self.optimizer = AdamW(
             model.parameters(), 
             lr=config.get('learning_rate'), 
@@ -181,10 +133,7 @@ class Trainer:
             pct_start=0.1
         )
         
-        # Mixed Precision Scaler
         self.scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == 'cuda'))
-        
-        # Tracking
         self.best_val_loss = float('inf')
         self.use_wandb = config.get('use_wandb', False)
         
@@ -200,32 +149,24 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]")
         
         for batch in pbar:
-            # Move batch to GPU
             batch = {k: v.to(self.device) for k, v in batch.items()}
             targets = batch.pop('targets')
             
-            # Forward Pass (Mixed Precision)
             with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
                 outputs = self.model(**batch)
                 loss_dict = self.loss_fn(outputs, targets)
                 loss = loss_dict['total_loss']
             
-            # Backward Pass
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
-            
-            # Gradient Clipping
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.scheduler.step()
             
-            # Metrics
             batch_size = targets.size(0)
             total_loss += loss.item() * batch_size
-            
             preds = outputs['score_logits'].argmax(dim=-1)
             total_correct += (preds == targets).sum().item()
             total_samples += targets.numel()
@@ -242,8 +183,6 @@ class Trainer:
         total_loss = 0
         total_correct = 0
         total_samples = 0
-        
-        # Per-class metrics
         class_correct = [0, 0, 0]
         class_total = [0, 0, 0]
 
@@ -258,16 +197,12 @@ class Trainer:
                 loss_dict = self.loss_fn(outputs, targets)
             
             loss = loss_dict['total_loss']
-            
-            # Aggregates
             batch_size = targets.size(0)
             total_loss += loss.item() * batch_size
-            
             preds = outputs['score_logits'].argmax(dim=-1)
             total_correct += (preds == targets).sum().item()
             total_samples += targets.numel()
             
-            # Class-wise stats
             for c in range(3):
                 mask = (targets == c)
                 class_correct[c] += ((preds == c) & mask).sum().item()
@@ -277,8 +212,6 @@ class Trainer:
         avg_acc = total_correct / total_samples
         
         metrics = {'loss': avg_loss, 'acc': avg_acc}
-        
-        # Add class-wise accuracy
         class_names = ['NoScore', 'OppScore', 'TeamScore']
         for i, name in enumerate(class_names):
             acc = class_correct[i] / (class_total[i] + 1e-6)
@@ -294,11 +227,7 @@ class Trainer:
             'config': self.config,
             'metrics': metrics
         }
-        
-        # Save latest
         torch.save(ckpt, self.output_dir / "latest.pt")
-        
-        # Save best
         if is_best:
             torch.save(ckpt, self.output_dir / "best_model.pt")
             logger.info(f"★ New Best Model Saved! Loss: {metrics['loss']:.4f}")
@@ -309,15 +238,12 @@ class Trainer:
             train_metrics = self.train_epoch(epoch)
             val_metrics = self.validate(epoch)
             
-            # Log results
             logger.info(
                 f"Epoch {epoch} | "
                 f"Train Loss: {train_metrics['loss']:.4f} Acc: {train_metrics['acc']:.2%} | "
                 f"Val Loss: {val_metrics['loss']:.4f} Acc: {val_metrics['acc']:.2%}"
             )
-            logger.info(f"Class Acc: NoScore: {val_metrics['acc_NoScore']:.1%} | Opp: {val_metrics['acc_OppScore']:.1%} | Team: {val_metrics['acc_TeamScore']:.1%}")
             
-            # WandB Logging
             if self.use_wandb:
                 wandb.log({
                     'epoch': epoch,
@@ -329,7 +255,6 @@ class Trainer:
                     'val/acc_TeamScore': val_metrics['acc_TeamScore']
                 })
             
-            # Checkpoint
             is_best = val_metrics['loss'] < self.best_val_loss
             if is_best: self.best_val_loss = val_metrics['loss']
             self.save_checkpoint(epoch, val_metrics, is_best)
@@ -343,28 +268,38 @@ class Trainer:
 
 def main():
     parser = argparse.ArgumentParser()
+    # Data params
     parser.add_argument('--data_dir', type=str, required=True, help='Path to processed .npy files')
     parser.add_argument('--output_dir', type=str, default='checkpoints')
+    
+    # Training Params
     parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    # Using 'learning_rate' to match your command, mapping to 'lr' internally
+    parser.add_argument('--learning_rate', type=float, default=1e-4, dest='lr') 
+    parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--use_wandb', action='store_true')
+
+    # Model Params (The missing ones causing the error)
+    parser.add_argument('--d_model', type=int, default=256)
+    parser.add_argument('--n_layers', type=int, default=6)
+    parser.add_argument('--n_heads', type=int, default=8)
+    parser.add_argument('--d_ff', type=int, default=1024)
+    parser.add_argument('--dropout', type=float, default=0.1)
+
     args = parser.parse_args()
 
     # 1. Prepare Datasets
     logger.info("Initializing Datasets...")
-    # Using 90/10 sequential split to avoid time-travel leakage
     train_ds = BasketballDataset(args.data_dir, split='train', split_ratio=0.9)
     val_ds = BasketballDataset(args.data_dir, split='val', split_ratio=0.9)
-    
-    # Calculate class weights from training data only
     class_weights = train_ds.get_class_weights()
 
     # 2. Dataloaders
     train_loader = DataLoader(
         train_ds, 
         batch_size=args.batch_size, 
-        shuffle=True, # Shuffle training samples (sequences), but sequences themselves are contiguous time
+        shuffle=True, 
         num_workers=4, 
         pin_memory=True
     )
@@ -379,16 +314,16 @@ def main():
     # 3. Model Configuration
     config = {
         'vocab_size': train_ds.vocab['vocab_size'],
-        'd_model': 256,
-        'n_heads': 8,
-        'n_layers': 6,
-        'd_ff': 1024,
-        'dropout': 0.1,
+        'd_model': args.d_model,
+        'n_heads': args.n_heads,
+        'n_layers': args.n_layers,
+        'd_ff': args.d_ff,
+        'dropout': args.dropout,
         'max_seq_len': train_ds.vocab['sequence_length'],
         # Training Params
         'epochs': args.epochs,
         'learning_rate': args.lr,
-        'weight_decay': 0.01,
+        'weight_decay': args.weight_decay,
         'label_smoothing': 0.1,
         'use_wandb': args.use_wandb
     }

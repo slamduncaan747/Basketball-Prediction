@@ -19,8 +19,11 @@ class GameContextEncoding(nn.Module):
         self.period_embedding = nn.Embedding(6, d_model // 4)
         self.team_embedding = nn.Embedding(3, d_model // 4)
         
-        # Combine everything
-        self.combine = nn.Linear(d_model + d_model // 4, d_model)
+        # --- FIX IS HERE ---
+        # We are concatenating 6 vectors of size (d_model // 4).
+        # So input size is 6 * (d_model // 4).
+        input_size = 6 * (d_model // 4)
+        self.combine = nn.Linear(input_size, d_model)
 
     def forward(self, score_diff, game_progress, clock, period, team_indicator, momentum_features):
         # Unsqueeze adds a dimension to match Linear layer input requirements (Batch, Seq, 1)
@@ -36,8 +39,10 @@ class GameContextEncoding(nn.Module):
         team_clamped = (team_indicator + 1).clamp(0, 2)
         team_emb = self.team_embedding(team_clamped)
         
-        # Concatenate all features and project down to d_model size
+        # Concatenate all features
+        # Shape: (Batch, Seq, 6 * (d_model // 4))
         context = torch.cat([score_emb, progress_emb, clock_emb, momentum_emb, period_emb, team_emb], dim=-1)
+        
         return self.combine(context)
 
 
