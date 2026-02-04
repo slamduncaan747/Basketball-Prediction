@@ -47,7 +47,7 @@ class BasketballDataset(Dataset):
         
         # Load event_ids first to determine size
         # mmap_mode='r' keeps the array on disk, only loading chunks when accessed
-        self.event_ids = np.load(self.data_dir / 'event_ids.npy', mmap_mode='r')
+        self.event_ids = np.load("../" / self.data_dir / 'event_ids.npy', mmap_mode='r')
         self.n_samples = len(self.event_ids)
         
         # --- CRITICAL: SEQUENTIAL SPLIT ---

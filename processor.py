@@ -39,12 +39,13 @@ class BasketballDataProcessor:
     def _make_seq(self, all_events, start_idx):
         segment = all_events[start_idx : start_idx + self.seq_len]
         
-        # Feature Extraction Logic
+        # --- 1. Basic Features ---
         e_ids = [self.event_map.get(e.get('event_category', 'OTHER'), 16) for e in segment]
         teams = [1 if e.get('is_home_team') else (0 if e.get('is_home_team') is False else -1) for e in segment]
         diffs = [e.get('score_differential', 0) for e in segment]
         periods = [int(e.get('period', 1)) for e in segment]
         
+        # --- 2. Temporal Features ---
         clocks = [float(e.get('clock_seconds', 0)) for e in segment]
         clock_norm = [c / 1200.0 for c in clocks]
         
@@ -55,50 +56,58 @@ class BasketballDataProcessor:
             else: prog = 1.0
             progress.append(min(max(prog, 0.0), 1.0))
 
-        # Dummy Momentum (Replace with real extractor if you have it)
+        # --- 3. Momentum Features (Placeholder) ---
         mom_feats = [[0.0] * 10 for _ in range(len(segment))] 
 
-        # Create Targets (Next scoring event)
+        # --- 4. Targets ---
         targets = []
         target_window = 5
         for i in range(len(segment)):
             curr_tid = segment[i].get('team_id')
             global_idx = start_idx + i
-            # Look ahead in the FULL event list, not just the segment
             future = all_events[global_idx+1 : global_idx+1+target_window]
             
-            outcome = 0 # No score
+            outcome = 0 
             for fe in future:
                 if fe.get('scoring_play'):
                     outcome = 2 if fe.get('team_id') == curr_tid else 1
                     break
             targets.append(outcome)
 
+        # === KEY FIX: MATCH NAMES TO TRAIN.PY ===
         return {
-            'event_ids': e_ids, 'team_indicators': teams, 'score_diffs': diffs,
-            'periods': periods, 'clock_norm': clock_norm, 'progress': progress,
-            'momentum': mom_feats, 'targets': targets
+            'event_ids': e_ids,
+            'team_indicators': teams,
+            'score_differentials': diffs,   # Renamed from score_diffs
+            'game_progress': progress,      # Renamed from progress
+            'clock_normalized': clock_norm, # Renamed from clock_norm
+            'periods': periods,
+            'momentum_features': mom_feats, # Renamed from momentum
+            'targets': targets
         }
 
     def save_data(self, sequences: List[Dict], output_dir: str):
-        """Saves processed sequences as numpy arrays."""
+        if not sequences:
+            logger.warning("No sequences generated! Check your input data.")
+            return
+
         out_path = Path(output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         
-        # Convert list of dicts to dict of lists for easier numpy conversion
+        # Convert list of dicts to dict of lists
         data_dict = {k: [s[k] for s in sequences] for k in sequences[0].keys()}
         
+        logger.info(f"Saving {len(sequences)} sequences to {output_dir}...")
+        
         for key, val in data_dict.items():
-            np.save(out_path / f"{key}.npy", np.array(val)) # Save as numpy
+            file_path = out_path / f"{key}.npy"
+            np.save(file_path, np.array(val))
+            logger.info(f"Saved {file_path}")
             
-        # Save Metadata
         with open(out_path / 'vocab.json', 'w') as f:
             json.dump({'vocab_size': len(self.event_map), 'sequence_length': self.seq_len}, f)
-        
-        logger.info(f"Saved processed data to {output_dir}")
 
 if __name__ == "__main__":
-    # Simple CLI for the processor
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', required=True)
